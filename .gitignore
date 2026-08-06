@@ -1,0 +1,18 @@
+# Secrets — a live logged-in Instagram session. NEVER commit.
+# Glob covers backups/variants (cookies.txt.bak, cookies.txt.1, etc.).
+cookies.txt*
+
+# Raw downloaded/moved source videos (large binaries; notes + screenshots are the value)
+**/_sources/
+
+# Transient staging for --ig-user before sort-captures files it into topics
+learnings/staging/
+
+# Python / OS cruft
+__pycache__/
+*.pyc
+.DS_Store
+
+# Personal capture output. The tool writes here; the content is yours, not the repo's.
+ig-memory/
+learnings/

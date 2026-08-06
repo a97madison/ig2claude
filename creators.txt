@@ -1,0 +1,2 @@
+# Creators to evaluate (last 30 days) with: ./evaluate-creators.sh
+# One IG handle per line (no @). Blank lines and #comments ignored.
