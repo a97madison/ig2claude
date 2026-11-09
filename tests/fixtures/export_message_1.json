@@ -1,0 +1,40 @@
+{
+  "_comment": "Synthetic Instagram Download-your-information message file. Not a real export. Participant text uses the export's latin-1 mojibake.",
+  "participants": [
+    {"name": "Main Account"},
+    {"name": "JosÃ© Learning"}
+  ],
+  "title": "JosÃ© Learning",
+  "thread_path": "inbox/jose_learning_9",
+  "messages": [
+    {
+      "sender_name": "Main Account",
+      "timestamp_ms": 1700000003000,
+      "content": "see JosÃ© https://www.instagram.com/reel/REELxxxx1/?igsh=abc",
+      "share": {
+        "link": "https://www.instagram.com/reel/REELxxxx1/?igsh=abc",
+        "share_text": "a caption"
+      }
+    },
+    {
+      "sender_name": "Main Account",
+      "timestamp_ms": 1700000002000,
+      "share": {
+        "link": "https://www.instagram.com/p/POST2222/"
+      }
+    },
+    {
+      "sender_name": "Main Account",
+      "timestamp_ms": 1700000001000,
+      "content": "story only https://www.instagram.com/stories/someone/12345/",
+      "share": {
+        "link": "https://www.instagram.com/stories/someone/12345/"
+      }
+    },
+    {
+      "sender_name": "Main Account",
+      "timestamp_ms": 1700000000000,
+      "content": "not ig https://example.com/p/FAKE123/ and https://www.instagram.com/share/OPAQUE99"
+    }
+  ]
+}

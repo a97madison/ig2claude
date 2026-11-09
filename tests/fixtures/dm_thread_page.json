@@ -1,0 +1,104 @@
+{
+  "_comment": "Synthetic direct_v2 thread page. Not a real Instagram response.",
+  "status": "ok",
+  "thread": {
+    "thread_id": "999001",
+    "users": [{"username": "learningacct", "pk": 42, "full_name": "Learning"}],
+    "has_older": true,
+    "oldest_cursor": "CURSOR_PAGE_2",
+    "items": [
+      {
+        "item_id": "m1",
+        "item_type": "media_share",
+        "timestamp": 1700000009000000,
+        "media_share": {
+          "code": "REELCODE1",
+          "media_type": 2,
+          "product_type": "clips"
+        }
+      },
+      {
+        "item_id": "m2",
+        "item_type": "media_share",
+        "timestamp": 1700000008000000,
+        "media_share": {
+          "code": "CAROUSEL1",
+          "media_type": 8,
+          "product_type": "feed",
+          "carousel_media": [{"id": "1"}, {"id": "2"}, {"id": "3"}]
+        }
+      },
+      {
+        "item_id": "m3",
+        "item_type": "clip",
+        "timestamp": 1700000007000000,
+        "clip": {
+          "clip": {
+            "code": "NESTEDCLIP",
+            "media_type": 2,
+            "product_type": "clips"
+          }
+        }
+      },
+      {
+        "item_id": "m4",
+        "item_type": "xma_media_share",
+        "timestamp": 1700000006000000,
+        "xma_media_share": [
+          {
+            "target_url": "https://www.instagram.com/p/XMAPOST99/?utm_source=ig_web",
+            "title": "a post"
+          }
+        ]
+      },
+      {
+        "item_id": "m4b",
+        "item_type": "generic_xma",
+        "timestamp": 1700000005500000,
+        "generic_xma": {
+          "target_url": "https://www.instagram.com/reel/XMAREEL55/"
+        }
+      },
+      {
+        "item_id": "m5",
+        "item_type": "text",
+        "timestamp": 1700000005000000,
+        "text": "look https://www.instagram.com/reel/TEXTREEL7/ and again https://www.instagram.com/reel/REELCODE1/ plus https://example.com/nope"
+      },
+      {
+        "item_id": "m6",
+        "item_type": "link",
+        "timestamp": 1700000004000000,
+        "link": {
+          "text": "https://www.instagram.com/tv/IGTVCODE1/",
+          "link_context": {"link_url": "https://www.instagram.com/tv/IGTVCODE1/"}
+        }
+      },
+      {
+        "item_id": "m7",
+        "item_type": "reel_share",
+        "timestamp": 1700000003000000,
+        "text": "while replying https://www.instagram.com/p/TYPEDPOST1/",
+        "reel_share": {
+          "text": "story reply",
+          "type": "reply",
+          "media": {"code": "STORYCODESHOULDNOTAPPEAR", "media_type": 2, "product_type": "story"}
+        }
+      },
+      {
+        "item_id": "m8",
+        "item_type": "media",
+        "timestamp": 1700000002000000,
+        "media": {"id": "direct-upload-not-a-post", "media_type": 1}
+      },
+      {
+        "item_id": "m9",
+        "item_type": "felix_share",
+        "timestamp": 1700000001000000,
+        "felix_share": {
+          "video": {"code": "FELIX999", "product_type": "igtv", "media_type": 2}
+        }
+      }
+    ]
+  }
+}
