@@ -430,7 +430,7 @@ def test_resolve_username_pages_inbox_and_numeric_id_skips_network():
     assert web.resolve_thread_id("@learningacct") == "777001"
     assert len(calls) == 2
     calls.clear()
-    direct = "340282366841710300949128137443719066522"
+    direct = "111111111111111111111111111111111111111"
     assert web.resolve_thread_id(f"https://www.instagram.com/direct/t/{direct}/") == direct
     assert calls == []
 
