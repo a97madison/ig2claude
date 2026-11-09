@@ -4,6 +4,8 @@
 Workflow:
   1. Share IG reels/posts/carousels to yourself, copy the links.
   2. Paste them into <mem-dir>/inbox.txt (default ./ig-memory/inbox.txt), one per line.
+     Or skip the paste: --from-dm reads a DM thread (live, via --cookies), and
+     --from-export reads an official Instagram data download.
   3. Run this script. Each new URL is fetched and turned into a structured
      markdown note (caption + transcript + carousel OCR when available),
      written into Claude Code memory and registered in an index.
@@ -23,9 +25,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import re
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +42,7 @@ DEFAULT_MEM_DIR = Path("ig-memory")  # project-relative; override with --mem-dir
 INDEX_NAME = "index.md"
 INBOX_NAME = "inbox.txt"
 PROCESSED_NAME = ".processed.json"
+DM_STATE_NAME = ".dm-state.json"
 
 URL_RE = re.compile(r"https?://(?:www\.)?instagram\.com/\S+", re.IGNORECASE)
 SHORTCODE_RE = re.compile(r"instagram\.com/(?:reel|reels|p|tv)/([A-Za-z0-9_-]+)")
@@ -634,6 +643,1043 @@ def update_index(mem_dir: Path, processed: dict) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# DM thread -> post / reel / carousel URLs
+# --------------------------------------------------------------------------- #
+# Live mode pages Instagram's web DM endpoints with the same Netscape cookies
+# file --cookies already uses. Export mode reads an official "Download your
+# information" JSON dump instead, which is the safer way to do the first big
+# backfill. Neither mode stores a password.
+
+DM_INBOX_URL = "https://www.instagram.com/api/v1/direct_v2/inbox/"
+DM_THREAD_URL = "https://www.instagram.com/api/v1/direct_v2/threads/{thread_id}/"
+DM_INBOX_REFERER = "https://www.instagram.com/direct/inbox/"
+IG_WEB_APP_ID = "936619743392459"
+IG_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
+)
+
+# Small pages and a multi-second jittered gap, matching the README guidance to
+# go slowly and back off when Instagram throttles. Backoff waits are longer.
+DM_PAGE_SIZE = 20
+DM_PAGE_DELAY_MIN = 4.0
+DM_PAGE_DELAY_MAX = 8.0
+DM_BACKOFF_START = 45.0
+DM_BACKOFF_MAX = 300.0
+DM_BACKOFF_ATTEMPTS = 4
+
+# reel_share / story_share are story replies, not saved posts. Their media
+# shortcodes are not /p/ or /reel/ permalinks, so they are not turned into URLs.
+# A post link typed in the message text is still collected.
+_STORY_ITEM_TYPES = {"reel_share", "story_share", "xma_story_share"}
+_THREAD_ID_RE = re.compile(r"^\d{8,}$")
+_THREAD_URL_RE = re.compile(r"instagram\.com/direct/t/(\d+)", re.IGNORECASE)
+_MESSAGE_FILE_RE = re.compile(r"message_(\d+)\.json$", re.IGNORECASE)
+
+
+class DmError(Exception):
+    """DM collection failed in a way a re-run might not fix by itself."""
+
+
+class DmRateLimit(DmError):
+    """Instagram rate-limited the session. Earlier pages are saved."""
+
+
+class DmLoginRequired(DmError):
+    """Cookies are missing, expired, or Instagram asked for a checkpoint."""
+
+
+class DmNotFound(DmError):
+    """The requested thread was not in the inbox or the export."""
+
+
+def dm_log(message: str) -> None:
+    """Progress for a DM pull. Stdout stays a clean URL list in --dry-run."""
+    print(f"dm    {message}", file=sys.stderr, flush=True)
+
+
+def post_code(url: str) -> str | None:
+    """Shortcode for a post/reel/tv URL, or None if it is not one."""
+    match = SHORTCODE_RE.search(url or "")
+    return match.group(1) if match else None
+
+
+def canonical_post_url(url: str) -> str | None:
+    """Normalize a post, reel, or IGTV permalink. None for stories and other links.
+
+    Query strings, trailing punctuation, and /reels/ (plural) are folded away so
+    the same media shared twice becomes one URL. Opaque /share/ links that hide
+    the shortcode are dropped; resolving them would mean extra requests.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return None
+    cleaned = url.strip().rstrip(".,);]>\"'")
+    match = re.search(
+        r"instagram\.com/(reel|reels|p|tv)/([A-Za-z0-9_-]+)",
+        cleaned,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    kind = match.group(1).lower()
+    if kind == "reels":
+        kind = "reel"
+    return f"https://www.instagram.com/{kind}/{match.group(2)}/"
+
+
+def urls_in_text(text: str) -> list[str]:
+    if not isinstance(text, str) or not text:
+        return []
+    found = []
+    for match in URL_RE.finditer(text):
+        url = canonical_post_url(match.group(0))
+        if url:
+            found.append(url)
+    return found
+
+
+def _unique_urls(urls: list[str], skip: set[str] | None = None) -> list[str]:
+    """Dedupe by shortcode, preserving first-seen (newest-first) order."""
+    seen = set(skip or ())
+    out = []
+    for url in urls:
+        code = post_code(url)
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        out.append(url)
+    return out
+
+
+def _kind_for_media(media: dict) -> str:
+    product = str(media.get("product_type") or "").lower()
+    if product == "clips":
+        return "reel"
+    if product in ("igtv", "tv"):
+        return "tv"
+    return "p"
+
+
+def url_from_media(media, depth: int = 0) -> str | None:
+    """Build a permalink from a DM media object (code + product_type, or a URL)."""
+    if not isinstance(media, dict) or depth > 4:
+        return None
+    for key in ("share_url", "target_url", "url"):
+        if isinstance(media.get(key), str):
+            got = canonical_post_url(media[key])
+            if got:
+                return got
+    code = media.get("code") or media.get("shortcode")
+    if isinstance(code, str) and code:
+        return f"https://www.instagram.com/{_kind_for_media(media)}/{code}/"
+    for key in ("clip", "video", "media"):
+        nested = media.get(key)
+        if isinstance(nested, dict):
+            got = url_from_media(nested, depth + 1)
+            if got:
+                return got
+    return None
+
+
+def _urls_from_xma(blob) -> list[str]:
+    if isinstance(blob, dict):
+        entries = [blob]
+    elif isinstance(blob, list):
+        entries = [entry for entry in blob if isinstance(entry, dict)]
+    else:
+        return []
+    found = []
+    for entry in entries:
+        for key in ("target_url", "url", "link"):
+            if isinstance(entry.get(key), str):
+                got = canonical_post_url(entry[key])
+                if got:
+                    found.append(got)
+        got = url_from_media(entry)
+        if got:
+            found.append(got)
+    return found
+
+
+def extract_urls_from_dm_item(item: dict) -> list[str]:
+    """Post/reel/carousel URLs from one web DM item (shared media or text)."""
+    if not isinstance(item, dict):
+        return []
+    found: list[str] = []
+    if isinstance(item.get("text"), str):
+        found.extend(urls_in_text(item["text"]))
+
+    link = item.get("link")
+    if isinstance(link, dict):
+        if isinstance(link.get("text"), str):
+            found.extend(urls_in_text(link["text"]))
+        context = link.get("link_context") if isinstance(link.get("link_context"), dict) else {}
+        for candidate in (link.get("url"), context.get("link_url")):
+            if isinstance(candidate, str):
+                got = canonical_post_url(candidate)
+                if got:
+                    found.append(got)
+
+    item_type = str(item.get("item_type") or "")
+    if item_type not in _STORY_ITEM_TYPES:
+        for key in ("media_share", "clip", "felix_share", "igtv_share"):
+            if isinstance(item.get(key), dict):
+                got = url_from_media(item[key])
+                if got:
+                    found.append(got)
+        for key in ("xma_media_share", "generic_xma", "xma_share", "xma_link"):
+            found.extend(_urls_from_xma(item.get(key)))
+    return _unique_urls(found)
+
+
+def extract_urls_from_dm_payload(payload: dict) -> list[str]:
+    """URLs from a direct_v2 thread response, newest item first."""
+    page = parse_thread_page(payload)
+    found: list[str] = []
+    for item in page["items"]:
+        found.extend(extract_urls_from_dm_item(item))
+    return _unique_urls(found)
+
+
+def parse_thread_page(payload: dict) -> dict:
+    """Normalize a thread response to items, oldest_cursor, has_older, newest_ts."""
+    if not isinstance(payload, dict):
+        raise DmError("Unexpected DM response (not a JSON object).")
+    thread = payload.get("thread") if isinstance(payload.get("thread"), dict) else payload
+    if not isinstance(thread, dict):
+        raise DmError("DM response had no thread.")
+    raw_items = thread.get("items") or []
+    items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+    cursor = thread.get("oldest_cursor") or thread.get("next_cursor") or None
+    if cursor is not None:
+        cursor = str(cursor)
+    has_older = bool(thread.get("has_older")) and bool(cursor)
+    timestamps = [
+        int(item["timestamp"])
+        for item in items
+        if isinstance(item.get("timestamp"), (int, float))
+    ]
+    return {
+        "items": items,
+        "oldest_cursor": cursor,
+        "has_older": has_older,
+        "newest_ts": max(timestamps) if timestamps else None,
+    }
+
+
+def parse_inbox_page(payload: dict) -> dict:
+    if not isinstance(payload, dict) or not isinstance(payload.get("inbox"), dict):
+        raise DmError("DM inbox response had no inbox object.")
+    inbox = payload["inbox"]
+    raw = inbox.get("threads") or []
+    threads = [thread for thread in raw if isinstance(thread, dict)] if isinstance(raw, list) else []
+    cursor = inbox.get("oldest_cursor") or inbox.get("next_cursor")
+    if cursor is not None:
+        cursor = str(cursor)
+    return {
+        "threads": threads,
+        "oldest_cursor": cursor,
+        "has_older": bool(inbox.get("has_older")) and bool(cursor),
+    }
+
+
+def fix_export_text(value: str) -> str:
+    """Undo the Download-your-information latin-1 mojibake on a string.
+
+    Instagram writes UTF-8 bytes, then those bytes are decoded as latin-1 and
+    stored in the JSON. ASCII (including URLs) is unchanged. Text that is
+    already proper Unicode is left alone when the round-trip is not valid UTF-8.
+    """
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        return value.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return value
+
+
+def _fix_export_obj(obj):
+    if isinstance(obj, str):
+        return fix_export_text(obj)
+    if isinstance(obj, list):
+        return [_fix_export_obj(item) for item in obj]
+    if isinstance(obj, dict):
+        fixed = {}
+        for key, val in obj.items():
+            fixed_key = fix_export_text(key) if isinstance(key, str) else key
+            fixed[fixed_key] = _fix_export_obj(val)
+        return fixed
+    return obj
+
+
+def decode_export_json(raw: bytes):
+    """Parse one export JSON file and fix mojibake in every string."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("latin-1")
+    return _fix_export_obj(json.loads(text))
+
+
+def extract_urls_from_export_message(msg: dict) -> list[str]:
+    """URLs from one export message: share.link and any permalinks in the text."""
+    if not isinstance(msg, dict):
+        return []
+    found: list[str] = []
+    if isinstance(msg.get("content"), str):
+        found.extend(urls_in_text(fix_export_text(msg["content"])))
+    share = msg.get("share")
+    if isinstance(share, dict):
+        link = share.get("link")
+        if isinstance(link, str):
+            got = canonical_post_url(fix_export_text(link))
+            if got:
+                found.append(got)
+        if isinstance(share.get("share_text"), str):
+            found.extend(urls_in_text(fix_export_text(share["share_text"])))
+    return _unique_urls(found)
+
+
+def captured_shortcodes(mem_dir: Path) -> set[str]:
+    """Shortcodes already written into the memory folder (index or note file)."""
+    codes: set[str] = set()
+    if not mem_dir.exists():
+        return codes
+    codes.update(load_processed(mem_dir).keys())
+    for path in mem_dir.glob("*.md"):
+        if path.name != INDEX_NAME:
+            codes.add(path.stem)
+    return codes
+
+
+def inbox_shortcodes(inbox: Path) -> set[str]:
+    codes: set[str] = set()
+    for url, _directive in read_inbox(inbox):
+        canonical = canonical_post_url(url)
+        code = post_code(canonical or url)
+        if code:
+            codes.add(code)
+    return codes
+
+
+def dedupe_post_urls(urls: list[str], mem_dir: Path, extra_codes: set[str] | None = None) -> list[str]:
+    """Drop URLs whose shortcode is already captured, or repeated in `urls`."""
+    skip = captured_shortcodes(mem_dir)
+    if extra_codes:
+        skip |= set(extra_codes)
+    return _unique_urls(urls, skip)
+
+
+def enqueue_urls(inbox: Path, urls: list[str]) -> int:
+    """Append new post URLs to the inbox. Existing lines (comments included) stay."""
+    if not urls:
+        return 0
+    existing = inbox.read_text(encoding="utf-8").splitlines() if inbox.exists() else []
+    have = inbox_shortcodes(inbox) if inbox.exists() else set()
+    fresh = []
+    for url in urls:
+        code = post_code(url)
+        if not code or code in have:
+            continue
+        have.add(code)
+        fresh.append(url)
+    if not fresh:
+        return 0
+    text = "\n".join([*existing, *fresh])
+    if text:
+        text += "\n"
+    inbox.parent.mkdir(parents=True, exist_ok=True)
+    inbox.write_text(text, encoding="utf-8")
+    return len(fresh)
+
+
+def dm_state_path(mem_dir: Path) -> Path:
+    return mem_dir / DM_STATE_NAME
+
+
+def load_dm_state(mem_dir: Path) -> dict | None:
+    path = dm_state_path(mem_dir)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_dm_state(mem_dir: Path, state: dict) -> None:
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    payload = dict(state)
+    payload["updated"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    dm_state_path(mem_dir).write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
+
+def _blank_dm_state(thread_key: str, thread_id: str) -> dict:
+    return {
+        "thread_key": thread_key,
+        "thread_id": thread_id,
+        "cursor": None,
+        "backfill_done": False,
+        "newest_ts": None,
+    }
+
+
+def _urls_from_items(items: list[dict], skip: set[str]) -> list[str]:
+    found: list[str] = []
+    for item in items:
+        found.extend(extract_urls_from_dm_item(item))
+    return _unique_urls(found, skip)
+
+
+def collect_thread_urls(
+    thread_key: str,
+    mem_dir: Path,
+    fetch_page,
+    *,
+    resolve_thread_id=None,
+    limit: int | None = None,
+    persist: bool = True,
+    sleep=None,
+    rng: random.Random | None = None,
+    extra_skip: set[str] | None = None,
+    on_commit=None,
+) -> list[str]:
+    """Page a thread newest-first and return post URLs not already captured.
+
+    `fetch_page(thread_id, cursor)` returns one direct_v2 thread JSON object.
+    `cursor` is None for the newest page. When `persist` is set, a cursor is
+    written to `<mem-dir>/.dm-state.json` after each fully consumed page so a
+    long backfill can stop and continue. A page that is only partly taken
+    because of `limit` does not advance the cursor.
+
+    After the backfill reaches the oldest message, later runs only walk new
+    messages at the head (newer than the saved timestamp) until they overlap
+    what was already synced.
+
+    Dry-runs pass persist=False: the saved cursor is still honored, but not moved.
+    `on_commit` receives each committed batch (used to append the inbox before
+    the cursor moves, so an interrupt cannot skip links).
+    """
+    if sleep is None:
+        sleep = time.sleep
+    if rng is None:
+        rng = random.Random()
+
+    skip = captured_shortcodes(mem_dir)
+    if extra_skip:
+        skip |= set(extra_skip)
+
+    state = load_dm_state(mem_dir) or {}
+    if state.get("thread_key") != thread_key or not state.get("thread_id"):
+        if resolve_thread_id is None:
+            raise DmError("No thread id for this DM pull.")
+        state = _blank_dm_state(thread_key, str(resolve_thread_id()))
+        if persist:
+            save_dm_state(mem_dir, state)
+    thread_id = str(state["thread_id"])
+    collected: list[str] = []
+
+    def commit(urls: list[str]) -> None:
+        if not urls:
+            return
+        collected.extend(urls)
+        for url in urls:
+            code = post_code(url)
+            if code:
+                skip.add(code)
+        if persist and on_commit:
+            on_commit(list(urls))
+
+    def take(urls: list[str]) -> tuple[list[str], bool]:
+        """(urls that fit in the limit, whether every url on the page was taken)."""
+        if limit is None:
+            return urls, True
+        room = limit - len(collected)
+        if len(urls) <= room:
+            return urls, True
+        return urls[: max(room, 0)], False
+
+    def pause() -> None:
+        sleep(rng.uniform(DM_PAGE_DELAY_MIN, DM_PAGE_DELAY_MAX))
+
+    if state.get("backfill_done"):
+        _collect_new_since(
+            state, thread_id, fetch_page, commit, take, pause, collected, skip,
+            mem_dir, persist, limit, thread_key,
+        )
+        return collected
+
+    cursor = state.get("cursor") or None
+    first = True
+    page_no = 0
+    while True:
+        if limit is not None and len(collected) >= limit:
+            return collected
+        if not first:
+            pause()
+        first = False
+        page_no += 1
+        page = parse_thread_page(fetch_page(thread_id, cursor))
+        if cursor is None and state.get("newest_ts") is None and page["newest_ts"] is not None:
+            state["newest_ts"] = page["newest_ts"]
+
+        chosen, consumed_all = take(_urls_from_items(page["items"], skip))
+        commit(chosen)
+        dm_log(f"{thread_key}  page {page_no}  +{len(chosen)} new ({len(collected)} this run)")
+        if not consumed_all:
+            if persist:
+                save_dm_state(mem_dir, state)
+            dm_log(f"{thread_key}  limit {limit} reached; resume cursor kept")
+            return collected
+
+        if page["has_older"]:
+            next_cursor = page["oldest_cursor"]
+            if not next_cursor or next_cursor == cursor:
+                raise DmError(
+                    "Instagram did not advance the thread cursor, so paging stopped. "
+                    "Re-run later. Links from finished pages stay in the inbox."
+                )
+            state["cursor"] = next_cursor
+            cursor = next_cursor
+            if persist:
+                save_dm_state(mem_dir, state)
+            if limit is not None and len(collected) >= limit:
+                return collected
+            continue
+
+        state["cursor"] = None
+        state["backfill_done"] = True
+        if persist:
+            save_dm_state(mem_dir, state)
+        dm_log(f"{thread_key}  reached the oldest message")
+        return collected
+
+
+def _collect_new_since(
+    state, thread_id, fetch_page, commit, take, pause, collected, skip,
+    mem_dir, persist, limit, thread_key,
+) -> None:
+    """After a finished backfill, collect only messages newer than newest_ts."""
+    cursor = None
+    head_ts = None
+    first = True
+    page_no = 0
+    known_ts = state.get("newest_ts")
+    while True:
+        if limit is not None and len(collected) >= limit:
+            return
+        if not first:
+            pause()
+        first = False
+        page_no += 1
+        page = parse_thread_page(fetch_page(thread_id, cursor))
+        if cursor is None and page["newest_ts"] is not None:
+            head_ts = page["newest_ts"]
+
+        fresh = []
+        overlapped = False
+        for item in page["items"]:
+            ts = item.get("timestamp")
+            if known_ts is not None and isinstance(ts, (int, float)) and int(ts) <= int(known_ts):
+                overlapped = True
+                break
+            fresh.append(item)
+
+        chosen, consumed_all = take(_urls_from_items(fresh, skip))
+        commit(chosen)
+        dm_log(f"{thread_key}  new page {page_no}  +{len(chosen)} ({len(collected)} this run)")
+        if not consumed_all:
+            dm_log(f"{thread_key}  limit {limit} reached; head cursor not moved")
+            return
+
+        if overlapped or not page["has_older"]:
+            if persist and head_ts is not None:
+                previous = state.get("newest_ts")
+                state["newest_ts"] = int(head_ts) if previous is None else max(int(previous), int(head_ts))
+                state["cursor"] = None
+                state["backfill_done"] = True
+                save_dm_state(mem_dir, state)
+            return
+
+        next_cursor = page["oldest_cursor"]
+        if not next_cursor or next_cursor == cursor:
+            raise DmError(
+                "Instagram did not advance the thread cursor while checking new messages."
+            )
+        cursor = next_cursor
+
+
+def normalize_thread_id(value: str) -> str | None:
+    """Return a numeric thread id, or None when `value` looks like a username."""
+    text = (value or "").strip()
+    match = _THREAD_URL_RE.search(text)
+    if match:
+        return match.group(1)
+    if _THREAD_ID_RE.match(text):
+        return text
+    return None
+
+
+def thread_matches_user(thread: dict, username: str) -> bool:
+    want = username.lstrip("@").strip().casefold()
+    if not want or not isinstance(thread, dict):
+        return False
+    for user in thread.get("users") or []:
+        if isinstance(user, dict) and str(user.get("username") or "").lstrip("@").casefold() == want:
+            return True
+    title = str(thread.get("thread_title") or "").lstrip("@").strip().casefold()
+    return title == want
+
+
+def classify_dm_response(status: int, payload) -> str:
+    """Return 'ok', 'rate_limit', 'login', or 'error'."""
+    if status == 429 or status in (500, 502, 503, 504):
+        return "rate_limit"
+    if status in (401, 403):
+        return "login"
+    if not isinstance(payload, dict):
+        return "error"
+    if payload.get("status") == "ok" or (
+        payload.get("status") is None and ("thread" in payload or "inbox" in payload)
+    ):
+        return "ok"
+    blob = " ".join(
+        str(payload.get(key) or "") for key in ("message", "error_type", "feedback_title")
+    ).lower()
+    if "login_required" in blob or "checkpoint" in blob or "consent_required" in blob:
+        return "login"
+    if payload.get("spam") is True or any(
+        token in blob for token in ("please wait", "rate limit", "rate_limit", "feedback_required", "try again")
+    ):
+        return "rate_limit"
+    return "error"
+
+
+def _response_detail(payload, status: int) -> str:
+    """Short reason safe to print. Never includes cookies or headers."""
+    if isinstance(payload, dict):
+        msg = payload.get("message") or payload.get("error_type") or ""
+        msg = re.sub(r"\s+", " ", str(msg)).strip()
+        if msg:
+            return msg[:180]
+    return f"HTTP {status}"
+
+
+def build_dm_headers(cookies: dict, referer: str) -> dict:
+    claim = cookies.get("ig_www_claim") or cookies.get("www_claim") or "0"
+    headers = {
+        "User-Agent": IG_USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": referer,
+        "X-IG-App-ID": IG_WEB_APP_ID,
+        "X-Requested-With": "XMLHttpRequest",
+        "X-ASBD-ID": "129477",
+        "X-IG-WWW-Claim": claim,
+    }
+    token = cookies.get("csrftoken")
+    if token:
+        headers["X-CSRFToken"] = token
+    headers["Cookie"] = "; ".join(f"{name}={value}" for name, value in cookies.items() if name and value)
+    return headers
+
+
+def http_get_json(url: str, headers: dict, timeout: int = 30):
+    """GET a URL. Returns (status, payload). Payload is a dict when the body is JSON."""
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = getattr(response, "status", 200)
+    except urllib.error.HTTPError as exc:
+        raw = exc.read()
+        status = exc.code
+    except urllib.error.URLError as exc:
+        raise DmError(f"Could not reach Instagram ({exc.reason}).") from exc
+    text = raw.decode("utf-8", "replace") if raw else ""
+    try:
+        payload = json.loads(text) if text else {}
+    except json.JSONDecodeError:
+        payload = {"message": text[:200]}
+    return status, payload
+
+
+def get_json(url, *, cookies, referer, http_get, sleep, rng, max_attempts=DM_BACKOFF_ATTEMPTS):
+    """GET JSON, backing off on rate limits. Raises DmLoginRequired or DmRateLimit."""
+    headers = build_dm_headers(cookies, referer)
+    delay = DM_BACKOFF_START
+    detail = "HTTP error"
+    for attempt in range(1, max_attempts + 1):
+        status, payload = http_get(url, headers)
+        kind = classify_dm_response(status, payload)
+        if kind == "ok":
+            return payload
+        detail = _response_detail(payload, status)
+        if kind == "login":
+            raise DmLoginRequired(
+                "Instagram rejected the session (login or checkpoint). "
+                "Re-export cookies.txt from the browser while logged in. "
+                f"({detail})"
+            )
+        if kind == "rate_limit":
+            if attempt == max_attempts:
+                break
+            wait = min(delay * rng.uniform(0.8, 1.2), DM_BACKOFF_MAX)
+            dm_log(f"rate limit ({detail}); waiting {wait:.0f}s (attempt {attempt}/{max_attempts})")
+            sleep(wait)
+            delay = min(delay * 2, DM_BACKOFF_MAX)
+            continue
+        raise DmError(f"Instagram DM request failed ({status}): {detail}")
+    raise DmRateLimit(
+        f"Instagram rate limit persisted after {max_attempts} attempts ({detail}). "
+        "Progress up to the previous page is saved. Re-run the same command later to continue."
+    )
+
+
+def load_netscape_cookies(path: Path) -> dict[str, str]:
+    """Parse a Netscape cookies.txt. Only instagram.com cookies are kept.
+
+    Values are returned as stored. This never reads a password; a cookies file
+    has no password field.
+    """
+    cookies: dict[str, str] = {}
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if line.startswith("#HttpOnly_"):
+            line = line[len("#HttpOnly_"):]
+        elif line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 7:
+            continue
+        domain = parts[0].lstrip(".").lower()
+        if domain != "instagram.com" and not domain.endswith(".instagram.com"):
+            continue
+        name = parts[5]
+        value = "\t".join(parts[6:])
+        if name:
+            cookies[name] = value
+    return cookies
+
+
+def require_ig_session(cookies: dict) -> None:
+    if not cookies.get("sessionid"):
+        raise DmLoginRequired(
+            "cookies file has no Instagram sessionid. "
+            "Export Netscape cookies while logged in to instagram.com."
+        )
+    if not cookies.get("csrftoken"):
+        dm_log("cookies file has no csrftoken; Instagram may reject the request")
+
+
+def build_inbox_url(cursor: str | None) -> str:
+    params = {
+        "persistentBadging": "true",
+        "folder": "",
+        "limit": str(DM_PAGE_SIZE),
+        "thread_message_limit": "1",
+    }
+    if cursor:
+        params["cursor"] = cursor
+    return DM_INBOX_URL + "?" + urllib.parse.urlencode(params)
+
+
+def build_thread_url(thread_id: str, cursor: str | None) -> str:
+    params = {
+        "visual_message_return_type": "unseen",
+        "direction": "older",
+        "limit": str(DM_PAGE_SIZE),
+    }
+    if cursor:
+        params["cursor"] = cursor
+    quoted = urllib.parse.quote(str(thread_id), safe="")
+    return DM_THREAD_URL.format(thread_id=quoted) + "?" + urllib.parse.urlencode(params)
+
+
+class InstagramWeb:
+    """Minimal client for the web inbox and thread endpoints."""
+
+    def __init__(self, cookies: dict, *, sleep=None, rng=None, http_get=None):
+        self.cookies = cookies
+        self.sleep = sleep or time.sleep
+        self.rng = rng or random.Random()
+        self.http_get = http_get or http_get_json
+
+    def get_json(self, url: str, referer: str) -> dict:
+        return get_json(
+            url,
+            cookies=self.cookies,
+            referer=referer,
+            http_get=self.http_get,
+            sleep=self.sleep,
+            rng=self.rng,
+        )
+
+    def resolve_thread_id(self, thread_key: str) -> str:
+        direct = normalize_thread_id(thread_key)
+        if direct:
+            return direct
+        cursor = None
+        seen: set[str] = set()
+        page_no = 0
+        while True:
+            if cursor:
+                self.sleep(self.rng.uniform(DM_PAGE_DELAY_MIN, DM_PAGE_DELAY_MAX))
+            payload = self.get_json(build_inbox_url(cursor), referer=DM_INBOX_REFERER)
+            page = parse_inbox_page(payload)
+            page_no += 1
+            for thread in page["threads"]:
+                if thread_matches_user(thread, thread_key):
+                    thread_id = str(thread.get("thread_id") or thread.get("thread_v2_id") or "")
+                    if thread_id:
+                        dm_log(f"thread {thread_key} is {thread_id}")
+                        return thread_id
+            next_cursor = page["oldest_cursor"]
+            if not page["has_older"] or not next_cursor or next_cursor in seen:
+                break
+            seen.add(next_cursor)
+            cursor = next_cursor
+            dm_log(f"inbox page {page_no}, still looking for {thread_key}")
+        raise DmNotFound(
+            f"No DM thread found for {thread_key}. "
+            "Pass that account's username, or the numeric id from instagram.com/direct/t/<id>/."
+        )
+
+    def fetch_thread_page(self, thread_id: str, cursor: str | None) -> dict:
+        referer = f"https://www.instagram.com/direct/t/{thread_id}/"
+        return self.get_json(build_thread_url(thread_id, cursor), referer=referer)
+
+
+def gather_live_urls(thread_key, cookies_path, mem_dir, inbox, limit, persist, on_commit=None) -> list[str]:
+    """Page the live DM thread. When persist is set, append URLs to the inbox as we go.
+
+    `on_commit` runs after each batch is appended, including when a later page
+    raises, so the caller can still capture links queued before the failure.
+    """
+    cookies = load_netscape_cookies(cookies_path)
+    require_ig_session(cookies)
+    client = InstagramWeb(cookies)
+    extra = inbox_shortcodes(inbox)
+
+    def commit(urls: list[str]) -> None:
+        enqueue_urls(inbox, urls)
+        if on_commit:
+            on_commit(urls)
+
+    return collect_thread_urls(
+        thread_key,
+        mem_dir,
+        client.fetch_thread_page,
+        resolve_thread_id=lambda: client.resolve_thread_id(thread_key),
+        limit=limit,
+        persist=persist,
+        extra_skip=extra,
+        on_commit=commit if persist else None,
+    )
+
+
+def _message_file_index(name: str) -> int:
+    match = _MESSAGE_FILE_RE.search(name.replace("\\", "/").split("/")[-1])
+    return int(match.group(1)) if match else 10**9
+
+
+def _score_export_thread(folder_name: str, meta: dict | None, key: str) -> int:
+    """Higher is a better match. 0 means this folder is not the requested thread."""
+    want = key.lstrip("@").strip().casefold()
+    folder = (folder_name or "").casefold()
+    if not want:
+        return 0
+    if folder == want:
+        return 100
+    if folder.startswith(want + "_"):
+        return 90
+    if folder.endswith("_" + want):
+        return 85
+    if isinstance(meta, dict):
+        if str(meta.get("title") or "").casefold() == want:
+            return 80
+        for part in meta.get("participants") or []:
+            if isinstance(part, dict) and str(part.get("name") or "").casefold() == want:
+                return 70
+    return 0
+
+
+def _select_scored_thread(scored: list[tuple[int, str]], thread_key: str, labels: list[str]) -> str:
+    if not scored:
+        preview = ", ".join(labels[:20]) or "(none)"
+        raise DmNotFound(
+            f"No thread in the export matched {thread_key}. "
+            f"Folders seen: {preview}. "
+            "Pass the other account's username or the thread folder name."
+        )
+    scored = sorted(scored, key=lambda pair: (-pair[0], pair[1]))
+    top = scored[0][0]
+    best = [label for score, label in scored if score == top]
+    if len(best) > 1:
+        preview = ", ".join(best[:20])
+        raise DmError(
+            f"Several threads matched {thread_key}: {preview}. "
+            "Pass the thread folder name, or point --from-export at that folder."
+        )
+    return best[0]
+
+
+def _thread_dirs_under(root: Path) -> list[Path]:
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for message in root.rglob("message_*.json"):
+        parent = message.parent
+        if parent in seen:
+            continue
+        seen.add(parent)
+        found.append(parent)
+    inbox_dirs = [path for path in found if "inbox" in path.parts]
+    return inbox_dirs or found
+
+
+def _messages_from_decoded(files_data: list[dict]) -> list[dict]:
+    """files_data is already in message_1, message_2, ... order (newest file first)."""
+    messages: list[dict] = []
+    for data in files_data:
+        raw = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(raw, list):
+            messages.extend(msg for msg in raw if isinstance(msg, dict))
+    return messages
+
+
+def _load_export_from_dir(root: Path, thread_key: str, *, force_this_dir: bool) -> list[dict]:
+    if force_this_dir:
+        files = sorted(root.glob("message_*.json"), key=lambda path: _message_file_index(path.name))
+        if not files:
+            raise DmNotFound(f"No message_*.json files in {root}.")
+        decoded = [decode_export_json(path.read_bytes()) for path in files]
+        dm_log(f"export thread folder {root.name} ({len(files)} file(s))")
+        return _messages_from_decoded([d for d in decoded if isinstance(d, dict)])
+
+    dirs = _thread_dirs_under(root)
+    if not dirs:
+        raise DmNotFound(f"No messages/inbox threads under {root}.")
+
+    def meta_for(path: Path) -> dict:
+        files = sorted(path.glob("message_*.json"), key=lambda item: _message_file_index(item.name))
+        if not files:
+            return {}
+        data = decode_export_json(files[0].read_bytes())
+        return data if isinstance(data, dict) else {}
+
+    scored = []
+    for path in dirs:
+        score = _score_export_thread(path.name, meta_for(path), thread_key)
+        if score:
+            scored.append((score, str(path)))
+    winner = Path(_select_scored_thread(scored, thread_key, [path.name for path in dirs]))
+    files = sorted(winner.glob("message_*.json"), key=lambda path: _message_file_index(path.name))
+    dm_log(f"export thread {winner.name} ({len(files)} file(s))")
+    decoded = [decode_export_json(path.read_bytes()) for path in files]
+    return _messages_from_decoded([d for d in decoded if isinstance(d, dict)])
+
+
+def _load_export_from_zip(path: Path, thread_key: str) -> list[dict]:
+    with zipfile.ZipFile(path) as zf:
+        names = [
+            name for name in zf.namelist()
+            if not name.endswith("/") and _MESSAGE_FILE_RE.search(name.replace("\\", "/").split("/")[-1])
+        ]
+        groups: dict[str, list[str]] = {}
+        for name in names:
+            folder = name.rsplit("/", 1)[0] if "/" in name else ""
+            groups.setdefault(folder, []).append(name)
+        inbox_groups = {
+            folder: files for folder, files in groups.items()
+            if "inbox" in folder.replace("\\", "/").split("/")
+        }
+        use = inbox_groups or groups
+        if not use:
+            raise DmNotFound(f"No messages/inbox threads inside {path.name}.")
+
+        def folder_label(folder: str) -> str:
+            if not folder:
+                return path.stem
+            return folder.replace("\\", "/").rstrip("/").split("/")[-1]
+
+        def read_meta(folder: str) -> dict:
+            files = sorted(use[folder], key=lambda name: _message_file_index(name))
+            data = decode_export_json(zf.read(files[0]))
+            return data if isinstance(data, dict) else {}
+
+        scored = []
+        for folder in use:
+            score = _score_export_thread(folder_label(folder), read_meta(folder), thread_key)
+            if score:
+                scored.append((score, folder))
+        winner = _select_scored_thread(scored, thread_key, [folder_label(folder) for folder in use])
+        files = sorted(use[winner], key=lambda name: _message_file_index(name))
+        dm_log(f"export thread {folder_label(winner)} ({len(files)} file(s) in zip)")
+        decoded = []
+        for name in files:
+            data = decode_export_json(zf.read(name))
+            if isinstance(data, dict):
+                decoded.append(data)
+        return _messages_from_decoded(decoded)
+
+
+def load_export_thread_messages(path: Path, thread_key: str) -> list[dict]:
+    """Messages from an unzipped download or a .zip, newest file first.
+
+    Within each message_N.json the export lists messages newest first, and
+    message_1.json is the newest file, so the returned list is newest first.
+    """
+    path = path.expanduser()
+    if not path.exists():
+        raise DmNotFound(f"export path not found: {path}")
+    if path.is_file() and path.suffix.lower() == ".zip":
+        return _load_export_from_zip(path, thread_key)
+    if path.is_file() and path.name.lower().startswith("message_") and path.suffix.lower() == ".json":
+        return _load_export_from_dir(path.parent, thread_key, force_this_dir=True)
+    if path.is_dir() and any(path.glob("message_*.json")):
+        return _load_export_from_dir(path, thread_key, force_this_dir=True)
+    if path.is_dir():
+        return _load_export_from_dir(path, thread_key, force_this_dir=False)
+    raise DmError(f"export path is not a folder, zip, or message JSON: {path}")
+
+
+def collect_export_urls(
+    path: Path,
+    thread_key: str,
+    mem_dir: Path,
+    *,
+    limit: int | None = None,
+    extra_skip: set[str] | None = None,
+) -> list[str]:
+    """Newest-first post URLs from an Instagram data download, deduped."""
+    messages = load_export_thread_messages(path, thread_key)
+    skip = captured_shortcodes(mem_dir)
+    if extra_skip:
+        skip |= set(extra_skip)
+    found: list[str] = []
+    seen = set(skip)
+    for msg in messages:
+        for url in extract_urls_from_export_message(msg):
+            code = post_code(url)
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            found.append(url)
+            if limit is not None and len(found) >= limit:
+                return found
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # Orchestration
 # --------------------------------------------------------------------------- #
 def process_url(url: str, mem_dir: Path, cookies: Path | None,
@@ -719,6 +1765,7 @@ def doctor(transcribe: bool, ocr: bool) -> None:
     print("Preflight check:")
     yt = have("yt-dlp") or have_mod("yt_dlp")  # launcher on PATH, or importable module
     print(f"  [{'ok' if yt else 'XX'}] yt-dlp        — fetching posts {'' if yt else '(REQUIRED; pip3 install yt-dlp)'}")
+    print("  [ok] dm thread     : shared post links via --from-dm (cookies) or --from-export")
     if transcribe:
         ff = have("ffmpeg"); fw = have_mod("faster_whisper")
         ok = ff and fw
@@ -782,6 +1829,93 @@ def process(mem_dir: Path, inbox: Path, cookies: Path | None, transcribe: bool =
     return new_count
 
 
+def _validate_dm_args(args) -> None:
+    using_dm = bool(args.from_dm or args.from_export)
+    if args.dm_limit is not None and args.dm_limit < 1:
+        print("--dm-limit must be a positive integer.", file=sys.stderr)
+        sys.exit(2)
+    if args.from_export and not args.from_dm:
+        print("--from-export needs --from-dm to name the thread (username or folder).", file=sys.stderr)
+        sys.exit(2)
+    if args.dry_run and not using_dm:
+        print("--dry-run is for --from-dm / --from-export.", file=sys.stderr)
+        sys.exit(2)
+    if args.dm_limit is not None and not using_dm:
+        print("--dm-limit is for --from-dm / --from-export.", file=sys.stderr)
+        sys.exit(2)
+    if args.urls and using_dm:
+        print("Pass URLs on the command line or use --from-dm, not both.", file=sys.stderr)
+        sys.exit(2)
+    if args.from_dm and not args.from_export and not args.cookies:
+        print("--from-dm needs --cookies cookies.txt (Netscape format).", file=sys.stderr)
+        sys.exit(2)
+    if args.from_export and not args.from_export.exists():
+        print(f"export path not found: {args.from_export}", file=sys.stderr)
+        sys.exit(2)
+
+
+def _run_dm_source(args, mem_dir: Path, inbox: Path) -> None:
+    """Collect DM URLs into the inbox, then run the normal capture flow.
+
+    --dry-run prints the URLs and does not write the inbox, the resume cursor,
+    or any notes. Export mode does not use the network.
+    """
+    limit = args.dm_limit
+    committed = {"n": 0}
+
+    def note_commit(count: int) -> None:
+        committed["n"] += count
+
+    try:
+        if args.from_export:
+            urls = collect_export_urls(
+                args.from_export,
+                args.from_dm,
+                mem_dir,
+                limit=limit,
+                extra_skip=inbox_shortcodes(inbox),
+            )
+            if not args.dry_run:
+                note_commit(enqueue_urls(inbox, urls))
+        else:
+            urls = gather_live_urls(
+                args.from_dm,
+                args.cookies,
+                mem_dir,
+                inbox,
+                limit,
+                persist=not args.dry_run,
+                on_commit=(lambda batch: note_commit(len(batch))) if not args.dry_run else None,
+            )
+    except DmError as exc:
+        print(str(exc), file=sys.stderr)
+        if committed["n"] and not args.dry_run:
+            print("Capturing links queued before the DM pull stopped.", file=sys.stderr)
+            process(
+                mem_dir, inbox, args.cookies,
+                transcribe=not args.no_transcribe, ocr=not args.no_ocr,
+                keep_inbox=args.keep_inbox, follow=not args.no_follow,
+            )
+        sys.exit(1 if isinstance(exc, DmRateLimit) else 2)
+
+    if args.dry_run:
+        for url in urls:
+            print(url)
+        print(f"{len(urls)} url(s); dry-run, nothing captured", file=sys.stderr)
+        return
+
+    if urls:
+        dm_log(f"queued {len(urls)} new link(s)")
+    if not read_inbox(inbox):
+        print("No new post links to capture.")
+        return
+    process(
+        mem_dir, inbox, args.cookies,
+        transcribe=not args.no_transcribe, ocr=not args.no_ocr,
+        keep_inbox=args.keep_inbox, follow=not args.no_follow,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Turn Instagram links into Claude Code memory (gap-aware).")
     parser.add_argument("--mem-dir", type=Path, default=DEFAULT_MEM_DIR,
@@ -790,6 +1924,18 @@ def main() -> None:
                         help="inbox file of URLs (default: <mem-dir>/inbox.txt)")
     parser.add_argument("--cookies", type=Path, default=None,
                         help="Netscape cookies.txt for login-required posts")
+    parser.add_argument("--from-dm", default=None, metavar="THREAD",
+                        help="pull shared post/reel/carousel links from this DM thread "
+                             "(other account's username, numeric thread id, or "
+                             "instagram.com/direct/t/<id>/ URL)")
+    parser.add_argument("--from-export", type=Path, default=None, metavar="PATH",
+                        help="read that thread from an Instagram data download "
+                             "(unzipped folder or .zip); use with --from-dm")
+    parser.add_argument("--dm-limit", type=int, default=None, metavar="N",
+                        help="take at most N new links from the DM thread this run (newest first)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="with --from-dm/--from-export, print the URLs and exit "
+                             "(no capture, inbox unchanged, resume cursor unchanged)")
     parser.add_argument("--no-transcribe", action="store_true",
                         help="skip Whisper audio transcription fallback (faster)")
     parser.add_argument("--no-ocr", action="store_true",
@@ -815,6 +1961,12 @@ def main() -> None:
     if args.cookies and not args.cookies.exists():
         print(f"cookies file not found: {args.cookies}", file=sys.stderr)
         sys.exit(2)
+
+    _validate_dm_args(args)
+
+    if args.from_dm or args.from_export:
+        _run_dm_source(args, mem_dir, inbox)
+        return
 
     if args.urls:
         mem_dir.mkdir(parents=True, exist_ok=True)

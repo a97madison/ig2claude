@@ -11,8 +11,13 @@ learnings/staging/
 # Python / OS cruft
 __pycache__/
 *.pyc
+.pytest_cache/
 .DS_Store
 
 # Personal capture output. The tool writes here; the content is yours, not the repo's.
 ig-memory/
 learnings/
+
+# DM backfill cursor (thread id + pagination cursor). Also covered by ig-memory/
+# above; this covers a custom --mem-dir.
+**/.dm-state.json

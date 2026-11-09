@@ -67,7 +67,8 @@ After your first run the tool prints the exact index path — paste it into
        python3 ig2claude.py
 
 Each new link becomes a note under `ig-memory/`; the index updates; re-runs skip
-anything already saved.
+anything already saved. To pull links out of a DM thread instead of pasting
+them, see "Pulling links from a DM thread" below.
 
 ### Telling Claude how to use a post
 
@@ -101,10 +102,61 @@ available. Run it on its own any time:
 
     --cookies cookies.txt   reach posts that require login (export via a browser
                             extension; the tool never sees your password)
+    --from-dm THREAD        pull shared post/reel/carousel links from a DM thread.
+                            THREAD is the other account's username, the numeric
+                            thread id, or an instagram.com/direct/t/<id>/ URL
+    --from-export PATH      read that thread from an Instagram "Download your
+                            information" folder or .zip (use with --from-dm).
+                            Offline. Best path for the first big backfill
+    --dm-limit N            take at most N new links from the thread this run
+                            (newest first). Re-run to continue
+    --dry-run               with --from-dm or --from-export, print the URLs and
+                            exit. Does not capture, does not change the inbox,
+                            and does not move the resume cursor
     --no-transcribe         skip Whisper audio transcription (faster)
     --no-ocr                skip OCR of carousel images (faster)
     --mem-dir PATH          store notes somewhere other than ./ig-memory
     --doctor                check dependencies and exit
+
+## Pulling links from a DM thread
+
+Save learning posts by sending them in a DM between your main account and a
+second account. The script collects post, reel, and carousel links from that
+thread (shared media and plain-text permalinks) and runs them through the same
+capture flow as the inbox, including gap reporting. Links already saved in the
+memory folder are skipped. Newest shares come first.
+
+Opaque `instagram.com/share/...` links that hide the shortcode are skipped.
+Story replies are not posts, so they are skipped too, unless the message text
+itself contains a post or reel URL.
+
+### Live session (`--from-dm`)
+
+Uses the Netscape cookies file from `--cookies` to page Instagram's web DM
+endpoints. It does not ask for or store your password. Pages are small, with
+about 4 to 8 seconds of jitter between them. On HTTP 429 or a rate-limit
+response it waits longer (starting around 45 seconds) and then stops, leaving
+a cursor in `<mem-dir>/.dm-state.json`. Re-run the same command to continue.
+`--dm-limit` caps how many new links this run will take.
+
+    python3 ig2claude.py --from-dm learningacct --cookies cookies.txt
+    python3 ig2claude.py --from-dm learningacct --cookies cookies.txt --dm-limit 30
+    python3 ig2claude.py --from-dm learningacct --cookies cookies.txt --dry-run
+
+`--dry-run` still talks to Instagram when you use `--from-dm` without
+`--from-export`, but it only prints URLs.
+
+### Export (`--from-export`)
+
+Offline, and the right way to do the first long backfill. In Instagram, use
+Download your information (JSON). Point `--from-export` at the unzipped folder
+or the `.zip`, and `--from-dm` at the other account's username or the thread
+folder name (`messages/inbox/<thread>/message_*.json`). Export text is stored
+with a latin-1 / UTF-8 mixup; the script fixes that before it reads names and
+links.
+
+    python3 ig2claude.py --from-export ~/Downloads/instagram-export --from-dm learningacct --dry-run
+    python3 ig2claude.py --from-export ~/Downloads/instagram-export.zip --from-dm learningacct
 
 ## Handling rate limits / login
 
@@ -112,6 +164,10 @@ Instagram throttles heavy scraping and increasingly requires login even for
 public posts. If you see `login_or_rate_limit` gaps: run fewer links at a time,
 wait, and/or supply `--cookies`. To make a cookies file, use a browser extension
 that exports cookies in Netscape format while logged in to Instagram.
+
+`--from-dm` already waits between inbox pages and backs off when Instagram
+rate-limits the thread request. If a run stops early, re-run it: the cursor
+file keeps the place, and links queued before the stop stay in the inbox.
 
 ## Scope / limits
 
